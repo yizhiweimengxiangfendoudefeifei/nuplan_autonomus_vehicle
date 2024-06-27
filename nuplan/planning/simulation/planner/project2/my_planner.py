@@ -24,6 +24,8 @@ from nuplan.common.actor_state.state_representation import StateSE2, StateVector
 from nuplan.common.actor_state.agent import Agent
 from nuplan.common.actor_state.tracked_objects import TrackedObject, TrackedObjects
 
+from scipy.sparse import csr_matrix
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,7 +98,7 @@ class MyPlanner(AbstractPlanner):
     def planning(self,
                  ego_state: EgoState,
                  reference_path_provider: ReferenceLineProvider,
-                 object: List[TrackedObjects],
+                 objects: List[TrackedObjects],
                  horizon_time: TimePoint,
                  sampling_time: TimePoint,
                  max_velocity: float) -> List[EgoState]:
@@ -116,10 +118,10 @@ class MyPlanner(AbstractPlanner):
 
 
 
-        """
+        
         # 可以实现基于采样的planer或者横纵向解耦的planner，此处给出planner的示例，仅提供实现思路供参考
         # 1.Path planning
-        optimal_path_l, optimal_path_dl, optimal_path_ddl, optimal_path_s = path_planning( \
+        optimal_path_l, optimal_path_dl, optimal_path_ddl, optimal_path_s = self.path_planning( \
             ego_state, reference_path_provider)
 
         # 2.Transform path planning result to cartesian frame
@@ -167,7 +169,7 @@ class MyPlanner(AbstractPlanner):
             )
 
             trajectory.append(state)
-        """
+        
 
 
 
@@ -177,3 +179,166 @@ class MyPlanner(AbstractPlanner):
 
         trajectory = []
         return trajectory
+    
+    def path_planning(self, 
+                      ego_state: EgoState, 
+                      reference_path_provider: ReferenceLineProvider):
+        """
+        Path planning based on the reference path.
+        :param ego_state: Ego state.
+        :param reference_path_provider: Reference path provider.
+        :return: l, dl, ddl, s
+        """
+        
+        optimal_path_l, optimal_path_dl, optimal_path_ddl, optimal_path_s = \
+                self.PathQuadraticProgramming(ego_state, reference_path_provider)
+        return optimal_path_l, optimal_path_dl, optimal_path_ddl, optimal_path_s
+    
+    def PathQuadraticProgramming(self, 
+                                 ego_state: EgoState, 
+                                 reference_path_provider: ReferenceLineProvider):
+        """
+        Path planning based on the reference path using quadratic programming.
+        :param ego_state: Ego state.
+        :param reference_path_provider: Reference path provider.
+        """
+        n = len(reference_path_provider._x_of_reference_line)
+        s = 0.0
+        ds = 0.2
+        optimal_path_l = []
+        optimal_path_dl = []
+        optimal_path_ddl = []
+        optimal_path_s = []
+        print(reference_path_provider._s_of_reference_line[-1])
+        while (s <= reference_path_provider._s_of_reference_line[-1]):
+            optimal_path_s.append(s)
+            optimal_path_l.append(0.0)
+            optimal_path_dl.append(0.0)
+            optimal_path_ddl.append(0.0)
+            s += ds
+        return optimal_path_l, optimal_path_dl, optimal_path_ddl, optimal_path_s
+        # 输出初始化
+        '''
+        n = len(reference_path_provider._x_of_reference_line)
+        if len(reference_path_provider._s_of_reference_line) < 2:
+            print("Reference path is too short.")
+            return None, None, None, None
+        w = 1.0 # 车辆宽度
+        ds = reference_path_provider._s_of_reference_line[1] - reference_path_provider._s_of_reference_line[0]
+        qp_path_l = np.zeros(n)
+        qp_path_dl = np.zeros(n)
+        qp_path_ddl = np.zeros(n)
+        qp_path_s = np.zeros(n)
+
+        # Hissen矩阵初始化
+        H = csr_matrix((3 * n, 3 * n))
+        H_L = csr_matrix((3 * n, 3 * n))
+        H_DL = csr_matrix((3 * n, 3 * n))
+        H_DDL = csr_matrix((3 * n, 3 * n))
+        H_DDDL = csr_matrix((n - 1, 3 * n))
+        H_CENTRE = csr_matrix((3 * n, 3 * n))
+        H_L_END = csr_matrix((3 * n, 3 * n))
+        H_DL_END = csr_matrix((3 * n, 3 * n))
+        H_DDL_END = csr_matrix((3 * n, 3 * n))
+
+        # Gradient matrix f
+        f = np.zeros(3 * n)
+
+        # 等式约束Aeq*x = beq,连续性约束
+        Aeq = csr_matrix((2 * n - 2, 3 * n))
+        beq = np.zeros(2 * n - 2)
+
+        # 动力学约束
+        lb = np.ones(3 * n) * (-float("inf"))
+        ub = np.ones(3 * n) * float("inf")
+
+        # 合并约束矩阵
+        A_merge = csr_matrix((2 * n - 2 + 3 * n, 3 * n))
+        lb_merge = np.zeros(2 * n - 2 + 3 * n)
+        ub_merge = np.zeros(2 * n - 2 + 3 * n)
+
+        # 生成 H_L, H_DL, H_DDL, H_CENTRE
+        for i in range(n):
+            H_L[3 * i, 3 * i] = 1
+            H_DL[3 * i + 1, 3 * i + 1] = 1
+            H_DDL[3 * i + 2, 3 * i + 2] = 1
+
+        H_CENTRE = H_L
+
+        # 生成 H_DDDL
+        for i in range(n - 1):
+            row = i
+            col = 3 * i
+            H_DDDL[row, col + 2] = 1
+            H_DDDL[row, col + 5] = -1
+
+        # 生成 H_L_END, H_DL_END, H_DDL_END
+        H_L_END[3 * n - 3, 3 * n - 3] = 0
+        H_DL_END[3 * n - 2, 3 * n - 2] = 0
+        H_DDL_END[3 * n - 1, 3 * n - 1] = 0
+
+        H = Config_.qp_cost_l * (H_L.transpose() * H_L) + \
+            Config_.qp_cost_dl * (H_DL.transpose() * H_DL) + \
+            Config_.qp_cost_ddl * (H_DDL.transpose() * H_DDL) + \
+            Config_.qp_cost_dddl * (H_DDDL.transpose() * H_DDDL) / (ds**2) + \
+            Config_.qp_cost_centre * (H_CENTRE.transpose() * H_CENTRE) + \
+            Config_.qp_cost_end_l * (H_L_END.transpose() * H_L_END) + \
+            Config_.qp_cost_end_dl * (H_DL_END.transpose() * H_DL_END) + \
+            Config_.qp_cost_end_ddl * (H_DDL_END.transpose() * H_DDL_END)
+        H = 2 * H
+
+        #  生成 f
+        center_line = reference_path_provider._discrete_path
+        for i in range(n):
+            f[3 * i] = -2.0 * 0.0
+            # 合理调节centerline的权重
+            if (math.fabs(f[3 * i]) > 0.3):
+                f[3 * i] = Config_.qp_cost_centre
+        
+        # 不等式约束
+        row_index_start = 0
+        for i in range(n - 1):
+            row = row_index_start + 2 * i
+            col = 3 * i
+            A_merge[row, col] = 1
+            A_merge[row, col + 1] = ds
+            A_merge[row, col + 2] = ds**2 / 3
+            A_merge[row, col + 3] = -1
+            A_merge[row, col + 5] = ds**2 / 6
+
+            A_merge[row + 1, col + 1] = 1
+            A_merge[row + 1, col + 2] = ds / 2
+            A_merge[row + 1, col + 4] = -1
+            A_merge[row + 1, col + 5] = ds / 2
+
+        row_index_start = 2 * n - 2
+
+        for i in range(n):
+            row = row_index_start + 3 * i
+            col = 3 * i
+            A_merge[row, col] = 1
+            A_merge[row + 1, col + 1] = 1
+            A_merge[row + 2, col + 2] = 1
+
+        # 生成 lb ub 主要是对规划起点做约束
+        lb = np.zeros((3 * n, 1))
+        ub = np.zeros((3 * n, 1))
+
+        lb[0] = 0.0
+        lb[1] = 0.0
+        lb[2] = 0.0
+        ub[0] = lb[0]
+        ub[1] = lb[1]
+        ub[2] = lb[2]
+
+        for i in range(1, n):
+            lb[3 * i] = 0.0 + w / 2
+            lb[3 * i + 1] = -2
+            lb[3 * i + 2] = -0.1
+            ub[3 * i] = 0.0 - w / 2
+            ub[3 * i + 1] = 2
+            ub[3 * i + 2] = 0.1
+
+        # 求解
+        init_variables = np.zeros((3 * n,))
+        '''
