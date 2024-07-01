@@ -25,6 +25,8 @@ from nuplan.common.actor_state.agent import Agent
 from nuplan.common.actor_state.tracked_objects import TrackedObject, TrackedObjects
 
 from scipy.sparse import csr_matrix
+from nuplan.planning.simulation.planner.project2.speed_planning import SpeedPlanning
+from nuplan.planning.simulation.planner.utils import planning_util
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,7 @@ class MyPlanner(AbstractPlanner):
         self._predictor: AbstractPredictor = None
         self._reference_path_provider: Optional[ReferenceLineProvider] = None
         self._routing_complete = False
+        self._speed_planning = SpeedPlanning()
 
     def initialize(self, initialization: PlannerInitialization) -> None:
         """Inherited, see superclass."""
@@ -131,9 +134,16 @@ class MyPlanner(AbstractPlanner):
                                                                                        reference_path_provider)
 
         # 3.Speed planning
-        optimal_speed_s, optimal_speed_s_dot, optimal_speed_s_2dot, optimal_speed_t = speed_planning( \
-            ego_state, horizon_time.time_s, max_velocity, objects, \
-            path_idx2s, path_x, path_y, path_heading, path_kappa)
+        ## Frenet 转 Cartesian
+        traj_init = []
+        for (x, y, h, k) in zip(path_x, path_y, path_heading, path_kappa):
+            traj_init.append((x,y,h,k))
+        optimal_speed_s, optimal_speed_s_dot, optimal_speed_s_2dot, optimal_speed_t = self.speed_planning( \
+            path_idx2s, path_x, path_y, path_heading, path_kappa,
+            ego_state, max_velocity, objects, traj_init)
+        
+            # ego_state, horizon_time.time_s, max_velocity, objects, \
+            # path_idx2s, path_x, path_y, path_heading, path_kappa)
 
         # 4.Produce ego trajectory
         state = EgoState(
@@ -342,3 +352,83 @@ class MyPlanner(AbstractPlanner):
         # 求解
         init_variables = np.zeros((3 * n,))
         '''
+    
+    def speed_planning(self, 
+                       path_index2s, path_x, path_y, path_heading, path_kappa,
+                       ego_state, reference_velocity, objects, traj_init):
+        """
+        速度规划
+        """
+        dy_obs_x_set = [], dy_obs_y_set = [], dy_obs_vx_set = [], dy_obs_vy_set = []
+        dy_obs_xy_set = [], dy_obs_vxy_set = [], dy_obs_axy_set = []
+        for x, y, vx, vy, ax, ay, _, _ in objects:
+            dy_obs_xy_set.append((x, y))
+            dy_obs_vxy_set.append((vx, vy))
+            dy_obs_axy_set.append((ax, ay))
+            dy_obs_x_set.append(x)
+            dy_obs_y_set.append(y)
+            dy_obs_vx_set.append(vx)
+            dy_obs_vy_set.append(vy)
+        # ego速度规划初始状态
+        plan_start_s_dot = ego_state.dynamic_car_state.rear_axle_velocity_2d.x # 车身坐标系
+        plan_start_s_dot2 = ego_state.dynamic_car_state.rear_axle_acceleration_2d.x
+        
+        # proj_node_list: [(x_p0, y_p0, heading_p0, kappa_p0), ...]
+        match_point_list_speed_, proj_node_list = planning_util.find_match_points(
+            xy_list=dy_obs_xy_set,
+            frenet_path_node_list=traj_init,
+            is_first_run=False,
+            pre_match_index=0)
+        proj_heading_list = [], proj_kappa_list = []
+        for _, _, h, k in proj_node_list:
+            proj_heading_list.append(h)
+            proj_kappa_list.append(k)
+
+        # 动态obs投影
+        dy_obs_s_list, dy_obs_l_list = planning_util.cal_s_l_fun(obs_xy_list=dy_obs_xy_set,
+                                                                  local_path_opt=traj_init,
+                                                                  s_map=path_index2s)
+        dy_obs_s_dot_list, dy_obs_l_dot_list, dy_obs_dl_ds_list = planning_util.cal_dy_obs_derivative(
+            l_set=dy_obs_l_list,
+            vx_set=dy_obs_vx_set,
+            vy_set=dy_obs_vy_set,
+            proj_heading_set=proj_heading_list,
+            proj_kappa_set=proj_kappa_list)
+
+        obs_st_sin_list, obs_st_sout_list, obs_st_tin_list, obs_st_tout_list = \
+        self._speed_planning.generate_st_graph(dynamic_obs_s_set=dy_obs_s_list,
+                                                  dynamic_obs_l_set=dy_obs_l_list,
+                                                  dynamic_obs_s_dot_set=dy_obs_s_dot_list,
+                                                  dynamic_obs_l_dot_set=dy_obs_l_dot_list)
+
+        dp_speed_s, dp_speed_t = self._speed_planning.speed_DP(obs_st_s_in_set=obs_st_sin_list,
+                                                              obs_st_s_out_set=obs_st_sout_list,
+                                                              obs_st_t_in_set=obs_st_tin_list,
+                                                              obs_st_t_out_set=obs_st_tout_list,
+                                                              plan_start_s_dot=plan_start_s_dot)
+        
+        s_lb, s_ub, s_dot_lb, s_dot_ub = self._speed_planning.generate_convex_space(
+            dp_speed_s=dp_speed_s,
+            dp_speed_t=dp_speed_t,
+            path_index2s=path_index2s,
+            obs_st_s_in_set=obs_st_sin_list,
+            obs_st_s_out_set=obs_st_sout_list,
+            obs_st_t_in_set=obs_st_tin_list,
+            obs_st_t_out_set=obs_st_tout_list,
+            trajectory_kappa_init=path_kappa)
+        
+        qp_s_init, qp_s_dot_init, qp_s_dot2_init, relative_time_init = self._speed_planning.speed_QP(
+            plan_start_s_dot=plan_start_s_dot,
+            plan_start_s_dot2=plan_start_s_dot2,
+            dp_speed_s=dp_speed_s,
+            dp_speed_t=dp_speed_t,
+            s_lb=s_lb,s_ub=s_ub,
+            s_dot_lb=s_dot_lb,
+            s_dot_ub=s_dot_ub)
+        
+        s, s_dot, s_dot2, relative_time = self._speed_planning.increase_points(s_init=qp_s_init,
+                                                                             s_dot_init=qp_s_dot_init,
+                                                                             s_dot2_init=qp_s_dot2_init,
+                                                                             relative_time_init=relative_time_init)
+        return s, s_dot, s_dot2, relative_time
+
